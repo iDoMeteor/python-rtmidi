@@ -24,7 +24,7 @@ colorama==0.4.6
     # via tox
 coverage==7.3.2
     # via -r requirements-dev.in
-cython==3.0.4
+cython==3.1.0
     # via -r requirements-dev.in
 distlib==0.3.7
     # via virtualenv
