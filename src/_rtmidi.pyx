@@ -111,6 +111,7 @@ import sys
 import warnings
 
 cimport cython
+from cpython.ref cimport PyObject
 from libcpp cimport bool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -211,8 +212,37 @@ cdef extern from *:
     """
     /* The MidiIn whose input callback is running on this thread, if any. */
     static thread_local void *rtmidi_callback_owner = NULL;
+
+    /* Destroys a RtMidiIn on a new thread (the thread that runs this does not
+       need a Python thread state); -1 if the thread could not be started. */
+    static void rtmidi_destroy_midiin_thread(void *ptr) {
+        delete static_cast<RtMidiIn *>(ptr);
+    }
+
+    static int rtmidi_destroy_midiin_later(RtMidiIn *ptr) {
+        return PyThread_start_new_thread(rtmidi_destroy_midiin_thread, ptr)
+            == (unsigned long)-1 ? -1 : 0;
+    }
+
+    /* Replaces the tp_clear slot of a GC type that has none; see MidiBase.
+       Returns 0 where the slot cannot be set (limited API, not CPython). */
+    static int rtmidi_set_tp_clear(PyObject *type, int (*clear)(PyObject *)) {
+    #if CYTHON_COMPILING_IN_CPYTHON && !CYTHON_COMPILING_IN_LIMITED_API
+        PyTypeObject *tp = (PyTypeObject *)type;
+
+        if (!PyType_HasFeature(tp, Py_TPFLAGS_HAVE_GC) || tp->tp_traverse == NULL)
+            return 0;
+
+        tp->tp_clear = clear;
+        return 1;
+    #else
+        return 0;
+    #endif
+    }
     """
     void *rtmidi_callback_owner
+    int rtmidi_destroy_midiin_later(RtMidiIn *ptr)
+    int rtmidi_set_tp_clear(PyObject *type, int (*clear)(PyObject *) noexcept)
 
 
 cdef void _cb_func(double delta_time, vector[unsigned char] *msg_v,
@@ -246,6 +276,11 @@ cdef void _cb_func(double delta_time, vector[unsigned char] *msg_v,
     try:
         func((message, delta_time), data)
     finally:
+        # These may be the last references to the instance (the garbage
+        # collector can clear its callbacks while this thread has picked one
+        # up). Release them while still marked as the instance's input thread,
+        # so that its deallocation does not wait for this thread.
+        callback = func = data = None
         rtmidi_callback_owner = outer_owner
 
 
@@ -499,14 +534,33 @@ def _default_error_handler(etype, msg, data=None):
 # with the thread state detached (free-threaded build). While ``close_port()``
 # waits, other calls on the instance raise ``InvalidUseError`` (or, for
 # ``get_message()``, return ``None``). Neither can be done by the input thread
-# itself: ``delete()`` raises there, and a deallocation there leaks the C++
-# instance (``rtmidi_callback_owner`` tells).
+# itself: ``delete()`` raises there, and a deallocation there leaves the
+# destruction to another thread (``rtmidi_callback_owner`` tells).
 #
-# ``no_gc_clear``: the garbage collector must not clear the callback fields
-# (tp_clear) while the C++ instance still exists, because on a free-threaded
-# build the input thread can be reading them at the same time. A reference
-# cycle through an instance's own callbacks is therefore not collected;
-# ``close_port()`` and ``delete()`` drop the callbacks, which breaks it.
+# Garbage collection: the callbacks can be part of a reference cycle (e.g.
+# ``midiin.set_callback(func, midiin)``), which the garbage collector must be
+# able to break. Cython's generated ``tp_clear`` would store to the callback
+# fields without ``_cb_lock``, racing with the input thread, which reads them
+# under it (on a free-threaded build the collector runs while other threads
+# do). So the classes are ``no_gc_clear``, which makes Cython generate no
+# ``tp_clear`` (``tp_traverse`` stays), and ``_install_gc_clear()`` sets
+# ``_gc_clear`` as their ``tp_clear`` at import. That drops the callbacks the
+# way ``_swap_callback()`` replaces them: under ``_cb_lock``, releasing the old
+# references after it. The input thread either got a callback before (and
+# holds its own references, which keep the instance alive) or finds ``None``.
+# Python subclasses reach it through ``subtype_clear``. Only unreachable
+# instances are cleared, so no method call on one is in progress: callers hold
+# a reference to it. The exception is the input thread, which is handed the
+# instance without one: it may pick up a callback after the collector found
+# the instance unreachable and before it clears it. The thread then holds the
+# last references to the instance, so ``_cb_func`` releases them before it
+# stops being the instance's ``rtmidi_callback_owner``, and
+# ``MidiIn.__dealloc__`` leaves the destruction of the C++ instance to another
+# thread if it runs on the input thread anyway.
+#
+# Where ``tp_clear`` cannot be set (limited API, not CPython), the classes
+# keep Cython's no_gc_clear behavior: cycles through callbacks are only broken
+# by ``close_port()`` and ``delete()``.
 
 @cython.no_gc_clear
 cdef class MidiBase:
@@ -583,7 +637,7 @@ cdef class MidiBase:
         with nogil:
             self._destroy(ptr)
 
-        # They may be part of a reference cycle (see no_gc_clear above).
+        # They may be part of a reference cycle.
         self._drop_callbacks()
 
     cdef void _drop_callbacks(self) noexcept:
@@ -1085,14 +1139,31 @@ cdef class MidiIn(MidiBase):
         """De-allocate pointer to C++ class instance."""
         cdef RtMidi *ptr = self._doomed if self.thisptr == NULL else <RtMidi *>self.thisptr
 
-        # If the last reference went away in this instance's own input
-        # callback, the destructor could not stop the thread it runs on, so
-        # the C++ instance is leaked.
-        if ptr != NULL and rtmidi_callback_owner != <void *>self:
-            # The destructor stops the input thread, which may be waiting to
-            # run a callback, so let it run.
-            with nogil:
-                self._destroy(ptr)
+        if ptr == NULL:
+            return
+
+        if rtmidi_callback_owner == <void *>self:
+            # The last reference went away in this instance's own input
+            # callback, and the destructor cannot stop the thread it runs on.
+            # So stop the thread from calling into this instance (and its
+            # error callback, which the destructor may call) and destroy the
+            # C++ instance on another thread, which waits for this one. If no
+            # thread can be started, it is leaked.
+            self._swap_error_callback(None)
+
+            try:
+                (<RtMidiIn *>ptr).cancelCallback()
+            except BaseException:
+                pass
+
+            ptr.setErrorCallback(NULL, NULL)
+            rtmidi_destroy_midiin_later(<RtMidiIn *>ptr)
+            return
+
+        # The destructor stops the input thread, which may be waiting to run a
+        # callback, so let it run.
+        with nogil:
+            self._destroy(ptr)
 
     def delete(self):
         """De-allocate pointer to C++ class instance.
@@ -1468,3 +1539,21 @@ cdef class MidiOut(MidiBase):
                 (<RtMidiOut *>ptr).sendMessage(&msg_v)
             finally:
                 self._exit()
+
+
+cdef int _gc_clear(PyObject *o) noexcept:
+    # tp_clear of the classes above (see "Garbage collection"). Must not raise.
+    (<MidiBase>o)._drop_callbacks()
+    return 0
+
+
+cdef void _install_gc_clear() noexcept:
+    # Before any instance exists, so that no subclass has inherited a slot yet.
+    # MidiIn and MidiOut have their own tp_traverse, so they do not inherit
+    # their base's tp_clear.
+    rtmidi_set_tp_clear(<PyObject *>MidiBase, &_gc_clear)
+    rtmidi_set_tp_clear(<PyObject *>MidiIn, &_gc_clear)
+    rtmidi_set_tp_clear(<PyObject *>MidiOut, &_gc_clear)
+
+
+_install_gc_clear()

@@ -17,10 +17,6 @@ Features:
 
 Changes:
 
--   The garbage collector no longer clears an instance's callbacks, because
-    the input thread may be using them. A reference cycle through them (e.g.
-    a callback whose `data` is the instance itself) is only broken by
-    `close_port()` (input callback) or `delete()`.
 -   While `MidiIn.close_port()` waits for the input thread, `get_message()`
     from another thread returns `None` and other calls on the instance raise
     `InvalidUseError`.
@@ -30,7 +26,9 @@ Fixes:
 -   Deleting the last reference to a `MidiIn` / `MidiOut` instance never
     freed the C++ instance (since 1.4.1), so its MIDI client and ports stayed
     open, and a `MidiIn` input thread kept running and could call a freed
-    callback when a message arrived.
+    callback when a message arrived. If the last reference goes away in the
+    instance's own input callback, the C++ instance is destroyed on another
+    thread.
 -   `MidiIn.close_port()` (and deleting a `MidiIn`) could deadlock when a
     message arrived for the input callback at the same moment.
 -   `MidiIn` / `MidiOut` instances no longer form a reference cycle with

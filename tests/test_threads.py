@@ -9,6 +9,7 @@ Each stress test runs for ``RTMIDI_STRESS_SECONDS`` (default 1) seconds.
 
 """
 
+import gc
 import os
 import subprocess
 import sys
@@ -77,6 +78,28 @@ def open_named(midi, name):
         except rtmidi.InvalidPortError:
             if time.monotonic() > deadline:
                 raise
+
+
+def port_names():
+    """Names of all ports that a MidiIn or MidiOut can list."""
+    names = []
+    probes = [rtmidi.MidiOut(API), rtmidi.MidiIn(API)]
+
+    try:
+        for probe in probes:
+            try:
+                names.extend(p for p in probe.get_ports() if p)
+            except rtmidi.InvalidPortError:  # one vanished while listing
+                pass
+    finally:
+        for probe in probes:
+            probe.delete()
+
+    return names
+
+
+def has_port(name):
+    return any(name in p for p in port_names())
 
 
 def run_threads(*targets, duration=DURATION):
@@ -454,17 +477,157 @@ class DeallocTests(unittest.TestCase):
         probe.delete()
 
     def test_close_port_breaks_callback_cycle(self):
-        # The garbage collector does not clear an instance's callbacks (they
-        # may be in use by the input thread), so a cycle through them is only
-        # broken by close_port() or delete().
+        # close_port() releases the input callback, so a cycle through it does
+        # not need the garbage collector.
         midi_in = rtmidi.MidiIn(API)
         midi_in.open_virtual_port(PREFIX + "-cycle")
         midi_in.set_callback(lambda event, data: None, midi_in)
         midi_in.close_port()
         del midi_in
-        probe = rtmidi.MidiOut(API)
-        self.assertFalse(any(PREFIX + "-cycle" in p for p in probe.get_ports()))
-        probe.delete()
+        self.assertFalse(has_port(PREFIX + "-cycle"))
+
+    def check_collected(self, name, make):
+        # ``make(name)`` returns an instance with an open virtual port ``name``
+        # that is part of a reference cycle, which only the garbage collector
+        # can break.
+        gc.collect()
+        gc.disable()  # not before we say so
+
+        try:
+            instance = make(name)
+            self.assertTrue(has_port(name))
+            del instance
+            self.assertTrue(has_port(name), "not in a cycle")
+            gc.collect()
+            self.assertFalse(has_port(name), "cycle was not collected")
+        finally:
+            gc.enable()
+
+    def test_gc_collects_input_callback_data_cycle(self):
+        def make(name):
+            midi_in = rtmidi.MidiIn(API)
+            midi_in.open_virtual_port(name)
+            midi_in.set_callback(lambda event, data: None, midi_in)
+            return midi_in
+
+        self.check_collected(PREFIX + "-gc-data", make)
+
+    def test_gc_collects_subclass_bound_method_cycle(self):
+        class Receiver(rtmidi.MidiIn):
+            def start(self, name):
+                self.open_virtual_port(name)
+                self.set_callback(self.on_message)  # self -> bound method -> self
+                self.myself = self  # a cycle through __dict__ as well
+
+            def on_message(self, event, data):
+                pass
+
+        def make(name):
+            receiver = Receiver(API)
+            receiver.start(name)
+            return receiver
+
+        self.check_collected(PREFIX + "-gc-method", make)
+
+    def test_gc_collects_error_callback_data_cycle(self):
+        def make_in(name):
+            midi_in = rtmidi.MidiIn(API)
+            midi_in.open_virtual_port(name)
+            midi_in.set_error_callback(lambda *args: None, midi_in)
+            return midi_in
+
+        def make_out(name):
+            midi_out = rtmidi.MidiOut(API)
+            midi_out.open_virtual_port(name)
+            midi_out.set_error_callback(lambda *args: None, midi_out)
+            return midi_out
+
+        self.check_collected(PREFIX + "-gc-errin", make_in)
+        self.check_collected(PREFIX + "-gc-errout", make_out)
+
+    def test_gc_keeps_callbacks_of_live_instance(self):
+        # An instance in a cycle that is still referenced keeps its callbacks.
+        received = []
+        midi_in = rtmidi.MidiIn(API)
+        midi_in.open_virtual_port(PREFIX + "-gc-live")
+        midi_in.set_callback(lambda event, data: received.append(event[0]), midi_in)
+        gc.collect()
+        midi_out = rtmidi.MidiOut(API)
+        open_named(midi_out, PREFIX + "-gc-live")
+        midi_out.send_message([0x90, 60, 100])
+        deadline = time.monotonic() + JOIN_TIMEOUT
+
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(received, [[0x90, 60, 100]])
+        midi_in.delete()
+        midi_out.delete()
+
+    def test_gc_collects_cycles_while_receiving(self):
+        # The collector clears an instance's callbacks while its input thread
+        # may be picking them up: another thread floods its port, a second one
+        # collects garbage, and each instance is dropped in the middle of it.
+        delivered = []
+
+        class Receiver(rtmidi.MidiIn):
+            received = 0
+
+            def start(self, name):
+                self.open_virtual_port(name)
+                self.set_callback(self.on_message, self)
+
+            def on_message(self, event, data):
+                self.received += 1
+                delivered.append(1)
+
+        def flood(source, stop):
+            while not stop.is_set():
+                try:
+                    source.send_message([0x90, 60, 100])
+                except rtmidi.RtMidiError:
+                    return
+
+        names = []
+
+        def churn(stop):
+            while not stop.is_set():
+                name = "%s-gc-race-%d" % (PREFIX, len(names))
+                names.append(name)
+                receiver = Receiver(API)
+                receiver.start(name)
+                source = rtmidi.MidiOut(API)
+                open_named(source, name)
+                flooding = threading.Event()
+                sender = threading.Thread(target=flood, args=(source, flooding))
+                sender.start()
+                deadline = time.monotonic() + JOIN_TIMEOUT
+
+                while not receiver.received and time.monotonic() < deadline:
+                    time.sleep(0.001)
+
+                del receiver
+                gc.collect()
+                flooding.set()
+                sender.join(JOIN_TIMEOUT)
+                source.delete()
+
+        def collect(stop):
+            while not stop.is_set():
+                gc.collect()
+                time.sleep(0.0005)
+
+        run_threads(churn, collect)
+        self.assertTrue(delivered)
+        left = names
+        deadline = time.monotonic() + JOIN_TIMEOUT
+
+        while left and time.monotonic() < deadline:
+            gc.collect()
+            left = [n for n in names if has_port(n)]
+            time.sleep(0.05)
+
+        self.assertEqual(left, [], "instances not destroyed")
 
 
 if __name__ == "__main__":
