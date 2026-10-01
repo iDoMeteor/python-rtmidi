@@ -60,11 +60,12 @@ instance: the C++ instance is then destroyed when that call returns. After
 ``is_port_open``, which still work, and ``close_port`` and ``delete``, which
 do nothing.
 
-The garbage collector cannot break a reference cycle that goes through an
-instance's own callbacks (for example a callback whose ``data`` is the
-``MidiIn`` itself), because the input thread may be using them.
-``MidiIn.close_port`` releases the input callback, and ``delete`` releases
-both callbacks, which breaks such cycles.
+Reference cycles through an instance's callbacks (for example a callback whose
+``data`` is the ``MidiIn`` itself) are collected by the garbage collector like
+any other; a message being delivered at that moment is dropped. If the last
+reference to a ``MidiIn`` goes away in its own input callback, the C++
+instance is destroyed on another thread, which waits for the callback to
+return.
 
 More usage examples can be found in the examples_ and tests_ directories
 of the source repository.
