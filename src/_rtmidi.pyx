@@ -1252,7 +1252,7 @@ cdef class MidiIn(MidiBase):
                 finally:
                     self._exit()
 
-    close_port.__doc__ == MidiBase.close_port.__doc__
+    close_port.__doc__ = MidiBase.close_port.__doc__
 
     def get_message(self):
         """Poll for MIDI input.
